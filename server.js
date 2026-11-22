@@ -1,8 +1,12 @@
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors"); // <-- 1. Import cors
+const cors = require("cors");
 const axios = require("axios");
 const { GoogleGenAI } = require("@google/genai");
+
+const MAX_GAMES = 5;
+const GEMINI_MODEL = "gemini-3.1-flash-lite";
+const GEMINI_TIMEOUT_MS = 15000;
 
 class CacheManager {
     constructor() {
@@ -40,30 +44,105 @@ class GameService {
             .filter(Boolean);
     }
 
-    async fetchGameDescription(gameId, fallbackSummary) {
+    async generateContentWithTimeout(params, timeoutMs = GEMINI_TIMEOUT_MS) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
         try {
-            const detailRes = await axios.get(
-                `https://api.rawg.io/api/games/${gameId}`,
-                {
-                    params: { key: this.rawgApiKey },
+            return await this.ai.models.generateContent({
+                ...params,
+                config: {
+                    ...(params.config || {}),
+                    abortSignal: controller.signal,
                 },
-            );
-            const rawDesc =
-                detailRes.data.description_raw ||
-                detailRes.data.description ||
-                "";
-            const cleanedDesc = rawDesc.replace(/<[^>]*>/g, "").trim();
-            return (
-                cleanedDesc ||
-                fallbackSummary ||
-                "Deskripsi game tidak tersedia."
-            );
-        } catch (err) {
-            return fallbackSummary || "Deskripsi game tidak tersedia.";
+            });
+        } finally {
+            clearTimeout(timer);
         }
     }
 
-    async getRecommendations({ description, genres, platforms, releasedDate }) {
+    async fetchGameDescription(rawgId, tag) {
+        const label = `rawg-desc:${rawgId}:${tag}`;
+        console.time(label);
+        try {
+            const res = await axios.get(
+                `https://api.rawg.io/api/games/${rawgId}`,
+                {
+                    params: { key: this.rawgApiKey },
+                    timeout: 6000,
+                },
+            );
+            return (
+                res.data?.description_raw ||
+                res.data?.description ||
+                "Deskripsi game tidak tersedia."
+            );
+        } catch (err) {
+            console.error(`RAWG desc error (${rawgId}):`, err.message);
+            return "Deskripsi game tidak tersedia.";
+        } finally {
+            console.timeEnd(label);
+        }
+    }
+
+    async fetchGameFromRAWG(title, reqId) {
+        const safeTitle = String(title)
+            .replace(/[^a-zA-Z0-9_-]/g, "_")
+            .slice(0, 25);
+        const tag = `${safeTitle}-${reqId}-${Math.random().toString(36).slice(2, 5)}`;
+        const searchLabel = `rawg-search:${tag}`;
+
+        console.time(searchLabel);
+        let searchEnded = false;
+        try {
+            const res = await axios.get("https://api.rawg.io/api/games", {
+                params: {
+                    key: this.rawgApiKey,
+                    search: title,
+                    page_size: 1,
+                },
+                timeout: 6000,
+            });
+            console.timeEnd(searchLabel);
+            searchEnded = true;
+
+            const results = res.data?.results;
+            if (!Array.isArray(results) || results.length === 0) {
+                return null;
+            }
+
+            const game = results[0];
+            const description = await this.fetchGameDescription(game.id, tag);
+
+            return {
+                id: game.id,
+                name: game.name,
+                rating: game.rating ?? 0,
+                releasedDate: game.released || "",
+                backgroundImage: game.background_image || "",
+                platforms: Array.isArray(game.platforms)
+                    ? game.platforms.map((p) => p.platform?.name).filter(Boolean)
+                    : [],
+                genre: Array.isArray(game.genres)
+                    ? game.genres.map((g) => g.name).filter(Boolean)
+                    : [],
+                description,
+            };
+        } catch (err) {
+            if (!searchEnded) {
+                console.timeEnd(searchLabel);
+            }
+            console.error(`RAWG fetch error (${title}):`, err.message);
+            return null;
+        }
+    }
+
+    async getRecommendations({
+        description,
+        genres,
+        platforms,
+        releasedDate,
+    }) {
         if (
             !description ||
             typeof description !== "string" ||
@@ -95,84 +174,73 @@ class GameService {
             return { source: "cache", data: this.cacheManager.get(cacheKey) };
         }
 
-        const aiPrompt = `Berikan rekomendasi 3 sampai 5 judul game yang paling sesuai dengan kriteria berikut:
-        - Deskripsi: "${cleanDescription}"
-        - Genres: ${normalizedGenres.length > 0 ? normalizedGenres.join(", ") : "Bebas"}
-        - Platforms: ${normalizedPlatforms.length > 0 ? normalizedPlatforms.join(", ") : "Bebas"}
-        - Released Date / Tahun: ${cleanReleasedDate || "Bebas"}
+        const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const totalLabel = `total-request:${reqId}`;
+        console.time(totalLabel);
 
-        Keluarkan hasilnya HANYA DALAM BENTUK ARRAY JSON berisikan nama-nama judul game saja tanpa teks tambahan, contoh format: ["Game A", "Game B", "Game C"]`;
-
-        const aiResponse = await this.ai.models.generateContent({
-            model: "gemini-3.6-flash",
-            contents: aiPrompt,
-        });
-
-        let gameTitles = [];
         try {
-            const cleanText = aiResponse.text
-                .replace(/```json/g, "")
-                .replace(/```/g, "")
-                .trim();
-            gameTitles = JSON.parse(cleanText);
-        } catch (parseError) {
-            throw new Error("Gagal memproses daftar game dari AI.");
-        }
+            const aiPrompt = `Berikan rekomendasi 5 judul game (minimal 3 dan maksimal 5 judul) yang paling sesuai dengan kriteria berikut:
+- Deskripsi: "${cleanDescription}"
+- Genres: ${normalizedGenres.length > 0 ? normalizedGenres.join(", ") : "Bebas"}
+- Platforms: ${normalizedPlatforms.length > 0 ? normalizedPlatforms.join(", ") : "Bebas"}
+- Released Date / Tahun: ${cleanReleasedDate || "Bebas"}
 
-        if (!Array.isArray(gameTitles) || gameTitles.length === 0) {
-            return { source: "api", data: [] };
-        }
+Keluarkan hasilnya HANYA DALAM BENTUK ARRAY JSON berisikan 3 sampai 5 nama judul game saja tanpa teks tambahan, contoh format: ["Game A", "Game B", "Game C"]`;
 
-        const gameDetailsPromises = gameTitles.map(async (title) => {
+            const geminiLabel = `gemini:${reqId}`;
+            console.time(geminiLabel);
+            let aiResponse;
             try {
-                const rawgRes = await axios.get(
-                    "https://api.rawg.io/api/games",
-                    {
-                        params: {
-                            key: this.rawgApiKey,
-                            search: title,
-                            page_size: 1,
-                        },
-                    },
-                );
-
-                if (rawgRes.data.results && rawgRes.data.results.length > 0) {
-                    const game = rawgRes.data.results[0];
-                    const gameGenres = game.genres
-                        ? game.genres.map((g) => g.name)
-                        : [];
-                    const gamePlatforms = game.platforms
-                        ? game.platforms.map((p) => p.platform.name)
-                        : [];
-                    const gameDescription = await this.fetchGameDescription(
-                        game.id,
-                        `${game.name} adalah game dengan genre ${gameGenres.join(", ") || "umum"}.`,
-                    );
-
-                    return {
-                        id: game.id,
-                        name: game.name,
-                        rating:
-                            typeof game.rating === "number" ? game.rating : 0,
-                        releasedDate: game.released || "",
-                        backgroundImage: game.background_image || "",
-                        platforms: gamePlatforms,
-                        genre: gameGenres,
-                        description: gameDescription,
-                    };
-                }
-                return null;
-            } catch (err) {
-                return null;
+                aiResponse = await this.generateContentWithTimeout({
+                    model: GEMINI_MODEL,
+                    contents: aiPrompt,
+                });
+            } finally {
+                console.timeEnd(geminiLabel);
             }
-        });
 
-        const gameDetailsResults = await Promise.all(gameDetailsPromises);
-        const validGames = gameDetailsResults.filter((item) => item !== null);
+            let gameTitles = [];
+            try {
+                const cleanText = aiResponse.text
+                    .replace(/```json/g, "")
+                    .replace(/```/g, "")
+                    .trim();
+                gameTitles = JSON.parse(cleanText);
+            } catch (parseError) {
+                throw new Error("Gagal memproses daftar game dari AI.");
+            }
 
-        this.cacheManager.set(cacheKey, validGames);
+            if (!Array.isArray(gameTitles) || gameTitles.length === 0) {
+                return { source: "api", data: [] };
+            }
 
-        return { source: "api", data: validGames };
+            const limitedTitles = gameTitles
+                .map((t) => String(t).trim())
+                .filter(Boolean)
+                .slice(0, MAX_GAMES);
+
+            const rawgTotalLabel = `rawg-total:${reqId}`;
+            console.time(rawgTotalLabel);
+            let gameDetailsResults;
+            try {
+                const gameDetailsPromises = limitedTitles.map((title) =>
+                    this.fetchGameFromRAWG(title, reqId),
+                );
+                gameDetailsResults = await Promise.all(gameDetailsPromises);
+            } finally {
+                console.timeEnd(rawgTotalLabel);
+            }
+
+            const validGames = gameDetailsResults.filter(
+                (item) => item !== null,
+            );
+
+            this.cacheManager.set(cacheKey, validGames);
+
+            return { source: "api", data: validGames };
+        } finally {
+            console.timeEnd(totalLabel);
+        }
     }
 }
 
@@ -190,11 +258,10 @@ class ServerApp {
     }
 
     configureMiddleware() {
-        // 2. Konfigurasi CORS untuk React lokal
         const allowedOrigins = [
-            "http://localhost:5173", // Vite default
+            "http://localhost:5173",
             "http://127.0.0.1:5173",
-            "http://localhost:3000", // CRA / port lain
+            "http://localhost:3000",
             "http://127.0.0.1:3000",
             "http://localhost:3001",
             "https://gamespoi.netlify.app",
@@ -203,7 +270,6 @@ class ServerApp {
         this.app.use(
             cors({
                 origin: (origin, callback) => {
-                    // Izinkan request tanpa origin (misal Postman/curl) atau dari daftar origin lokal
                     if (!origin || allowedOrigins.includes(origin)) {
                         callback(null, true);
                     } else {
